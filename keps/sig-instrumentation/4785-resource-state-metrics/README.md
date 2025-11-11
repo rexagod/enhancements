@@ -547,6 +547,173 @@ status:
 [3x faster]: https://github.com/rexagod/resource-state-metrics/blob/main/tests/bench/bench.sh
 [plural ambiguities]: https://github.com/kubernetes-sigs/kubebuilder/issues/3402
 
+For BETA graduation, we plan on moving away from the extensible
+resolvers-based architecture to a single stub-based configuration.
+This is a direct consequence of the fact that it is not possible
+to sustainably maintain (from contributors' perspective) and utilize
+(from users' perspective) the former architecture (introduced in
+ALPHA) without facing the same set of issues that Kube State Metrics'
+Custom Resource State API faces today (passing context between
+fields, relying on workarounds, whenever possible, to achieve
+relatively simple metric generation use-cases, educating oneself
+on the steep nature and the side-effects of Kube State Metrics'
+Custom Resource State API's declarations to avoid pitfalls, etc).
+
+Possibly, the **only** way to achieve sustainable stability for
+both of the aforementioned audiences is to not rely on multiple
+resolvers that compensate for each other's shortcomings, but to
+have a single, well-defined way of declaring metric generation
+configurations. This approach **must be** turing-complete, recognizing
+the fact that expression-based languages, such as CEL or `expr`,
+are not sufficient for the task at hand. Furthermore, they still
+introduce a steep learning curve for users unfamiliar with these
+DSLs. Promising DSLs still lack the constructs and principals that
+are necessary to express complex metric generation configurations
+properly, that is, they may work for simple, even some complex
+use-cases, but they will end up being barely maintainable or readable
+as the use-cases get more complex.
+
+The stub-based configuration, on the other hand, relies on Golang
+itself, not compiled, but [interpreted] at runtime, which is a
+language that is widely known and used in the Kubernetes ecosystem.
+This will significantly lower the learning curve for users, while
+also providing the necessary constructs to express complex use-cases
+properly and cleanly. Folks can leverage reusability to import
+similar code into stubs, and can also rely on the rich ecosystem
+of Golang libraries to achieve their goals. This will also make it
+easier for contributors to add new features to the controller, as
+they can now focus on implementing new stubs, rather than having
+to deal with the complexities of the resolvers-based architecture.
+It is worth mentioning that the symbols and libraries made available
+to the stub sandboxes will be carefully curated to avoid security
+issues, run with a timed context to prevent any leaks. Users may
+inject symbols during initialization to allow defining stubs to
+utilize them at runtime. Furthermore, additional constraints, such
+as limiting stub execution for objects matching certain label or
+field selectors, can still be added.
+
+A sample configuration that follows this idea is as follows:
+
+```yaml
+apiVersion: resource-state-metrics.instrumentation.k8s-sigs.io/v1alpha1
+kind: ResourceMetricsMonitor
+metadata:
+  name: prefilled
+  namespace: default
+spec:
+  configuration: |-
+    stores:
+      - group: "contoso.com"
+        version: "v1alpha1"
+        kind: "MyPlatform"
+        resource: "myplatforms"
+        families:
+          - name: "test_metric"
+            help: "helpless"
+            metrics:
+              - stubs:
+                  - |
+                    package foo
+                    import (
+                      "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+                      "github.com/kubernetes-sigs/resource-state-metrics/pkg/utils"
+                      klog "k8s.io/klog/v2"
+                    )
+                    func samples(o *unstructured.Unstructured) []utils.SampleType {
+                      klog.InfoS("Generating samples for resource",
+                        "name", o.GetName(),
+                        "namespace", o.GetNamespace(),
+                        "kind", o.GetKind(),
+                        "apiVersion", o.GetAPIVersion(),
+                        "uid", o.GetUID(),
+                      )
+                      return []utils.SampleType{
+                        {
+                          LabelKeys:  []string{"name"},
+                          LabelValues: []string{o.GetName()},
+                          Value: 1,
+                        },
+                      }
+                    }
+```
+
+Notice the standard as well as custom symbols used in the stub
+above. Additionally, because multiple fields are replaced by a
+single stub, context can easily be passed between label-sets and
+the metric value generation logic, whenever necessary. Additionally,
+owing to Golang's widespread adoption within the cloud-native
+ecosystem, users can easily hit the ground running in no time.
+
+The proposed practise is to define more stubs which are coherent
+in themselves, rather than having a single monolithic stub that
+does everything. This will improve readability and maintainability
+of the stubs, while also allowing reusability of code between stubs.
+Users can also leverage Golang's package management capabilities
+to import and use existing libraries, whenever possible.
+
+The `samples` function defined in the stub above will be invoked
+for each object of the managed resource, and the returned samples
+will be collected and exposed as Prometheus metrics.
+
+Below is the code snippet that executes the stub and extracts the
+samples from it:
+
+```go
+func executeStub(stub string, unstructuredTyped *unstructured.Unstructured) ([]SampleType, error) {
+	timeout := 5 * time.Second
+	ctx, cancelFn := context.WithTimeout(context.WithValue(context.Background(), "timeout", timeout), timeout)
+	defer cancelFn()
+
+	interpreter := interp.New(interp.Options{})
+	err := interpreter.Use(stdlib.Symbols)
+	if err != nil {
+		panic(err)
+	}
+	err = interpreter.Use(interp.Exports{
+		// Yaegi uses "path/packagename" format.
+		"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured/unstructured": map[string]reflect.Value{
+			"Unstructured": reflect.ValueOf((*unstructured.Unstructured)(nil)),
+		},
+		"github.com/kubernetes-sigs/resource-state-metrics/pkg/utils/utils": map[string]reflect.Value{
+			"SampleType": reflect.ValueOf((*SampleType)(nil)),
+		},
+		"k8s.io/klog/v2/v2": map[string]reflect.Value{
+			"InfoS":  reflect.ValueOf(klog.InfoS),
+			"Error":  reflect.ValueOf(klog.Error),
+			"ErrorS": reflect.ValueOf(klog.ErrorS),
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	_, err = interpreter.EvalWithContext(ctx, stub)
+	if err != nil {
+		return nil, fmt.Errorf("error evaluating stub: %w", err)
+	}
+	samples, err := interpreter.EvalWithContext(ctx, "foo.samples")
+	if err != nil {
+		return nil, fmt.Errorf("error extracting samples from stub: %w", err)
+	}
+	if !samples.CanInterface() {
+		return nil, fmt.Errorf("unable to interface stub result")
+	}
+	samplesInterface := samples.Interface()
+	samplesFn, ok := samplesInterface.(func(*unstructured.Unstructured) []SampleType)
+	if !ok {
+		return nil, fmt.Errorf("expected stub result to be of type []SampleType but got %T", samplesInterface)
+	}
+	resolvedSamples := samplesFn(unstructuredTyped)
+
+	return resolvedSamples, nil
+}
+```
+
+This approach ensures that there's never a shortage of expressiveness when it
+comes to defining metric generation configurations, while also lowering the
+learning and maintenance curve for users and maintainers, respectively.
+
+[interpreted]: https://github.com/traefik/yaegi
+
 ### Test Plan
 
 <!--
