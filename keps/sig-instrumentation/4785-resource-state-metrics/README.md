@@ -547,6 +547,356 @@ status:
 [3x faster]: https://github.com/rexagod/resource-state-metrics/blob/main/tests/bench/bench.sh
 [plural ambiguities]: https://github.com/kubernetes-sigs/kubebuilder/issues/3402
 
+#### Design changes since ALPHA
+
+The points laid out above stand true for the ALPHA implementation of Resource
+State Metrics, i.e., up until the commit: [`f3c2a8d`]. However, after careful
+consideration of the maintainability and scalability aspects of the controller,
+and the overall user experience, the following design changes were made, in 
+chronological order:
+* Shifting from an extensible resolvers-based architecture to a single
+stub-based configuration approach for metric generation. The rationale
+behind this change is that the current approach faces challenges in
+maintenance and utilization, and the existing domain-specific languages
+are insufficient for handling complex use cases that users need to
+address.
+* The proposed solution used a stub-based configuration that leveraged
+Golang as an interpreted language at runtime (using [Yaegi]). This
+approach provides more flexibility and expressiveness compared to the
+previous system, while also lowering the learning curve for users and
+enabling easier code reusability. The implementation offers several
+benefits including making it easier for contributors to add new features
+(significantly lesser side effects since the core generation logic isn't
+scattered across fields), using carefully curated symbols and libraries
+to ensure security, supporting runtime symbol control, and allowing the
+addition of constraints like label and field selectors.
+* The [commit] demonstrates the new approach through YAML configuration
+with embedded Golang stubs, showing how to define metric generation
+functions and generate metrics from Kubernetes resources.
+* However, due to maintenance concerns with the [Yaegi] interpreter, the
+design was revised to use a more stable and maintainable approach. The
+current design philosophy follows a "95-5" approach, where 95% of the use
+cases are covered by [Starlark], a "turing-ish" language, used extensively
+by build tools such as Bazel for scripting in embedded environments. The
+remaining 5% of use cases that require more complex logic can be addressed
+using an RPC-based plugin system, allowing users to "bring their own code"
+for metric generation.
+* The design further evolved to adopt a discovery-based architecture with
+separation of concerns. Instead of embedding all configuration in a single
+ResourceMetricsMonitor CR, the system now uses three distinct CRs:
+  - `ResourceMetricsMonitor` (RMM): Meta-configuration controlling discovery
+    parameters, execution timeouts, cardinality limits, etc.
+  - `ResourceMetricsMonitorMetrics` (RMMM): Starlark-based metrics (95%)
+  - `ResourceMetricsMonitorPlugin` (RMMP): RPC-based plugins (5%)
+* This separation addresses critical security and scalability concerns:
+  - **Team Autonomy**: Teams deploy RMMM/RMMP CRs in their namespaces
+    without modifying the central RMM configuration.
+  - **Security Isolation**: Starlark code runs with RSM's cluster-wide
+    permissions (sandboxed but trusted), while plugins run in separate pods
+    with team-managed `ServiceAccounts` and scoped RBAC permissions.
+  - **Discovery**: RMM discovers RMMM/RMMP CRs via annotations, enabling
+    self-service metric configuration.
+A sample `ResourceMetricsMonitor` configuration looks like this:
+```yaml
+apiVersion: resource-state-metrics.instrumentation.k8s-sigs.io/v1alpha1
+kind: ResourceMetricsMonitor
+metadata:
+  name: myplatform-monitor
+  namespace: production
+spec:
+  discovery:
+    metricsAnnotation: "discoverable"
+    pluginAnnotation: "discoverable"
+    fieldSelector: ""  # Optional field selector for discovery
+    labelSelector: {}  # Optional label selector for discovery
+  execution:
+    starlarkTimeout: 5s
+    pluginTimeout: 10s
+    reconcileInterval: 30s
+  cardinality:
+    maxTotalCardinality: 10000
+    maxCardinalityPerFamily: 1000
+    onLimitExceeded: "drop"
+    exemptFamilies: ["myplatform_info"]
+status:
+  metrics:
+  - name: myplatform-basic-metrics
+    type: starlark
+    families:
+    - name: myplatform_info
+      cardinality: 3
+  - name: database-plugin
+    type: plugin
+    families:
+    - name: myplatform_external_usage
+      cardinality: 15
+    pluginRef: database-plugin.production.svc:9090
+  totalCardinality: 18
+```
+Plugins run as sidecar services that teams deploy independently,
+communicating with RSM over HTTP/HTTPS. The overall design flow looks like this:
+```
+┌──────────────────────────────────────────────────────────┐
+│ ResourceMetricsMonitor (Meta config)                     │
+│  spec:                                                   │
+│   • discovery: {metricsAnnotation, pluginAnnotation}     │
+│   • execution: {starlarkTimeout, pluginTimeout}          │
+│   • cardinality: {maxTotal, maxPerFamily, onExceeded}    │
+│  status:                                                 │
+│   • metrics: [{name, type, families: [{name, card}]}]    │
+│   • totalCardinality                                     │
+└──────────────────────────────────────────────────────────┘
+                ↓ (discovers via annotations)
+        ┌───────┴────────┐
+        ↓                ↓
+┌──────────────┐    ┌─────────────────────────┐
+│ RMMM         │    │ RMMP                    │
+│ (Starlark)   │    │ (Plugin)                │
+├──────────────┤    ├─────────────────────────┤
+│ • GVK        │    │ • GVK                   │
+│ • Selectors  │    │ • Selectors             │
+│ • Starlark   │    │ • endpoint: {svc, port} │
+│              │    │ • tls: {enabled, ca}    │
+│ Runs in RSM  │    │ Runs in team pod with   │
+│ with RSM's   │    │ team's ServiceAccount   │
+│ cluster      │    │ and RBAC                │
+│ permissions  │    │                         │
+└──────────────┘    └─────────────────────────┘
+        │                      │
+        │ (in-process)         │ (net/rpc over network)
+        │                      │
+        └──────────┬───────────┘
+                   ↓
+           Prometheus Metrics
+                   ↓ (exposed on)
+               /metrics
+```
+* Starlark is specifically engineered for safe embedding with hermetic
+  execution that prevents access to the file system, network, or system
+  clock by default. Its deterministic evaluation guarantees identical
+  results across executions, critical for consistent monitoring in
+  distributed Kubernetes environments. The language provides Python-like
+  familiarity while eliminating dangerous features like exceptions,
+  reflection, unbounded loops, and user-defined classes. 
+* ResourceMetricsMonitorMetrics (RMMM) defines GVK, selectors, and Starlark
+  code for metric generation. Teams deploy RMMM CRs with annotations that
+  bind them to specific RMM instances:
+  ```yaml
+  apiVersion: resource-state-metrics.instrumentation.k8s-sigs.io/v1alpha1
+  kind: ResourceMetricsMonitorMetrics
+  metadata:
+    name: myplatform-metrics
+    namespace: production
+    annotations:
+      discoverable: "true"
+  spec:
+  - resource:
+      group: "contoso.com"
+      version: "v1alpha1"
+      kind: "MyPlatform"
+      fieldSelector: "status.phase=Running"
+      labelSelector:
+        matchLabels:
+          tier: production
+      families:
+      - name: "myplatform_info"
+        help: "Information about MyPlatform instances"
+        metrics:
+          - stubs:
+              - # ...
+  ```
+* Below are patterns that have surfaced frequently in Kube State Metrics'
+Custom Resource State user-stories, and how they can be expressed in
+Starlark:
+  * Pattern A: Multiple Samples from One Resource
+    ```yaml
+    - name: "myplatform_features"
+      help: "Features enabled on each platform"
+      metrics:
+        - stubs:
+            - |
+              def samples(obj):
+                  features = obj.get("spec", "features")
+                  if features == None or type(features) != "list":
+                      return []
+    
+                  # Generate one sample per feature
+                  result = []
+                  for feature in features:
+                      result.append(
+                          sample(
+                              label_keys=["platform", "feature"],
+                              label_values=[obj.name, feature],
+                              value=1.0
+                          )
+                      )
+                  return result
+    
+    # Output:
+    # (myplatform_features{platform="prod-platform",feature="feature-a",...} 1.0)
+    # (myplatform_features{platform="prod-platform",feature="feature-b",...} 1.0)
+    ```
+  * Pattern B: Conditional Logic
+    ```yaml
+    - name: "myplatform_health"
+      help: "Health status (1=healthy, 0=unhealthy)"
+      metrics:
+        - stubs:
+            - |
+              def samples(obj):
+                  ready = obj.get("status", "ready")
+                  replicas = obj.get("spec", "replicas")
+    
+                  # Determine health based on multiple conditions
+                  health = 0.0
+                  if ready and replicas != None and replicas > 0:
+                      health = 1.0
+    
+                  return [
+                      sample(
+                          label_keys=["name", "status"],
+                          label_values=[obj.name, "healthy" if health else "unhealthy"],
+                          value=health
+                      )
+                  ]
+    ```
+  * Pattern C: AddonStubs (Reusable Label Sets)
+    ```yaml
+    families:
+      - name: "myplatform_cpu_usage"
+        help: "CPU usage per platform"
+        # AddonStubs run first and provide labels for ALL metrics in this family
+        addonStubs:
+          - |
+            def samples(obj):
+                return [
+                    sample(
+                        label_keys=["region", "tier"],
+                        label_values=[
+                            obj.get("metadata", "labels", "region"),
+                            obj.get("spec", "environmentType")
+                        ],
+                        value=0.0  # Value ignored for addon stubs
+                    )
+                ]
+        metrics:
+          - stubs:
+              - |
+                def samples(obj):
+                    cpu = obj.get("status", "cpuUsage")
+                    return [sample(label_keys=["name"], label_values=[obj.name], value=float(cpu))]
+          # Result: All metrics get region+tier labels automatically
+    ```
+  * Pattern D: Error Handling
+    ```yaml
+    - stubs:
+        - |
+          def samples(obj):
+              try:
+                  # Attempt to parse a complex field
+                  config = obj.get("spec", "config")
+                  if config == None:
+                      error("Missing config section", "platform", obj.name)
+                      return []
+    
+                  timeout = config.get("timeout")
+                  if timeout == None:
+                      info("Using default timeout", "platform", obj.name)
+                      timeout = 30
+    
+                  # Parse duration string "30s" → 30
+                  timeout_seconds = float(timeout.rstrip("s"))
+    
+                  return [
+                      sample(
+                          label_keys=["name"],
+                          label_values=[obj.name],
+                          value=timeout_seconds
+                      )
+                  ]
+              except Exception as e:
+                  error("Failed to generate metric", "platform", obj.name, "error", str(e))
+                  return []
+    # The above stub logs errors/info without crashing the controller and returns no samples on failure.
+    # This is exclusively dependent on the `sample` and `error`/`info` functions exposed by the controller.
+    # The injected functions may be modified to leverage more signals, such as emitting metrics, with limited cardinality, to provide better insights into stubs.
+    ```
+* For use cases requiring external data access (databases, APIs), complex
+  computations (ML models), or native libraries, teams deploy plugins as
+  separate pods with their own `ServiceAccounts` and RBAC, providing security
+  isolation from RSM's cluster-wide permissions.
+* Plugins use `net/rpc` over HTTP/HTTPS (stdlib, zero dependencies, no
+  protobuf compilation, easier debugging, but subject to change if we go with 
+  gRPC). A single plugin handles multiple GVKs and must have RBAC to
+  access resources it monitors:
+  ```yaml
+  apiVersion: resource-state-metrics.instrumentation.k8s-sigs.io/v1alpha1
+  kind: ResourceMetricsMonitorPlugin
+  metadata:
+    name: database-plugin
+    annotations:
+      discoverable: "true"
+  spec:
+    resources:
+      - group: "contoso.com"
+        version: "v1alpha1"
+        kind: "MyPlatform"
+        fieldSelector: "spec.databaseEnabled=true"
+      - group: "contoso.com"
+        version: "v1"
+        kind: "Database"
+        labelSelector:
+          matchLabels:
+            managed-by: database-plugin
+    endpoint:
+      service: database-plugin
+      port: 9090
+      tls:
+        enabled: true
+  ```
+* Plugin signature takes no arguments (fetches resources itself):
+  ```go
+  func (p *Plugin) GenerateSamples(
+      args *struct{},
+      reply *GenerateSamplesReply) error {
+      // Plugin lists/watches resources using its own ServiceAccount
+      platforms := p.clientset.List(...)  // Requires RBAC
+      // Query external DB, call APIs, run ML models, etc.
+      reply.Samples = []SampleType{{Name: "...", Value: 42.0}}
+      return nil
+  }
+  ```
+* Teams deploy with scoped RBAC for resource access:
+  ```yaml
+  rules:
+    - apiGroups: ["contoso.com"]
+      resources: ["myplatforms", "databases"]
+      verbs: ["get", "list", "watch"]
+    - apiGroups: [""]
+      resources: ["secrets"]
+      resourceNames: ["db-credentials"]
+      verbs: ["get"]
+  ```
+* RSM provides significant value over writing a standalone exporter: 
+   * automatic Prometheus exposition: plugin returns samples, RSM handles /metrics endpoint, HELP/TYPE headers, metric registration,
+   * cardinality enforcement: RSM applies RMM-level limits, drops/errors on exceeded thresholds,
+   * automatic GVK label injection: group/version/kind added to all samples,
+   * health monitoring and status: RSM polls plugins periodically, reports health in RMMP status, marks unhealthy plugins in RMM aggregated status, 
+   * discovery and lifecycle: plugins self-register via RMMP CRs, RSM handles connection management, TLS, timeouts,
+   * centralized status: RMM aggregates all metrics sources with family-level cardinality in .status, 
+   * standardized observability: consistent /metrics, /healthz across all plugins. 
+    
+  Plugins focus solely on metric generation logic, not Prometheus mechanics.
+* Permission model: Starlark (RMMM) runs in-process with RSM's cluster-wide
+  ServiceAccount (sandboxed, trusted). Plugins (RMMP) run in separate pods
+  with team ServiceAccounts requiring explicit RBAC for resource access
+  (secure, multi-tenant safe).
+
+[Starlark]: https://github.com/google/starlark-go
+[Yaegi]: https://github.com/traefik/yaegi
+[commit]: https://github.com/kubernetes/enhancements/commit/ff956a4de6d9337b672fa7f0b9de8afd9a5cc559
+[`f3c2a8d`]: https://github.com/rexagod/resource-state-metrics/commit/f3c2a8deff2f612c4b26157d6cd1bdc008118604
+
 ### Test Plan
 
 <!--
